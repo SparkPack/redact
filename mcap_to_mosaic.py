@@ -13,6 +13,7 @@ of drifting; a feed with no frame yet at a given instant holds its previous fram
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import subprocess
 import sys
@@ -85,6 +86,16 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
             packets[t] = packets[t][first:]
             times[t] = times[t][first:]
 
+    # Detections are keyed by the source log time, which survives cutting, so a report made on the
+    # ORIGINAL recording still lines up with an excerpt taken out of it.
+    faces: dict = {}
+    if args.faces:
+        for ff in json.loads(Path(args.faces).read_text())["files"]:
+            for c in ff["channels"]:
+                m = faces.setdefault(c["topic"], {})
+                for x in c["detections"]:
+                    m.setdefault(round(x["log_time"], 4), []).extend(x["boxes"])
+
     t0 = min(v[0] for v in times.values() if v)
     t1 = max(v[-1] for v in times.values() if v)
     fps = args.fps or round(max((len(v) - 1) / (v[-1] - v[0]) for v in times.values() if len(v) > 1), 3)
@@ -118,6 +129,7 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
                             args.codec if args.codec in tools.encoders else "libx264",
                             args.nvenc_preset, args.cq, args.gpu_index)
     cur = {t: None for t in topics}       # most recent decoded frame per feed
+    cur_t = {t: None for t in topics}     # source log time of that frame, for matching detections
     nxt_idx = {t: 0 for t in topics}      # next message index awaiting its turn
     blank = np.full((th, tw, 3), 24, np.uint8)
     written = 0
@@ -132,6 +144,7 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
                         nxt_idx[t] = len(times[t])
                         break
                     cur[t] = fr
+                    cur_t[t] = times[t][nxt_idx[t]]
                     nxt_idx[t] += 1
             if args.every > 1 and k % args.every:
                 continue          # frame decoded and discarded: keeps the feeds in sync, shortens output
@@ -141,6 +154,21 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
                     tile = blank.copy()
                 else:
                     tile = cv2.resize(cur[t], (tw, th), interpolation=cv2.INTER_AREA)
+                    if faces.get(t) and cur_t[t] is not None:
+                        # Detection runs at a stride, so a box exists on every Nth frame only. Hold it
+                        # over the neighbouring frames or it flickers past too fast to see.
+                        sx, sy = tw / dims[t][0], th / dims[t][1]
+                        for k, boxes in faces[t].items():
+                            if abs(k - cur_t[t]) > args.face_hold_s:
+                                continue
+                            for b in boxes:
+                                p0 = (int(b[0] * sx), int(b[1] * sy))
+                                p1 = (int(b[2] * sx), int(b[3] * sy))
+                                cv2.rectangle(tile, p0, p1, (0, 0, 255), 2)
+                                if len(b) > 4:
+                                    cv2.putText(tile, f"{b[4]:.2f}", (p0[0], max(10, p0[1] - 4)),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1,
+                                                cv2.LINE_AA)
                 name = t.strip("/").replace("/video", "")
                 tiles.append(label(tile, name, f"{stamp - t0:6.2f}s" if t == topics[0] else ""))
             while len(tiles) < rows * cols:
@@ -171,6 +199,12 @@ def main(argv=None) -> int:
     ap.add_argument("input", type=Path, help=".mcap file or a folder of them")
     ap.add_argument("output", type=Path, help="output .mp4, or a folder when the input is a folder")
     ap.add_argument("--topics", nargs="+", default=None, help="only these video topics")
+    ap.add_argument("--faces", type=Path, default=None,
+                    help="a detect_faces_mcap report; draw a red box on every face it found. Matching "
+                         "is by source log time, so a report made on the original recording still "
+                         "lines up with a clip cut out of it.")
+    ap.add_argument("--face-hold-s", type=float, default=0.2,
+                    help="keep each box visible this long either side of its frame (default 0.2)")
     ap.add_argument("--cols", type=int, default=None, help="grid columns (default 3 for 5+ feeds, else 2)")
     ap.add_argument("--tile-width", type=int, default=640, help="width of each tile in pixels")
     ap.add_argument("--fps", type=float, default=None, help="output frame rate (default: the source rate)")
