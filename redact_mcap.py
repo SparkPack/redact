@@ -66,8 +66,12 @@ def cut_one(src: Path, out_dir: Path, entry: dict, args) -> list:
     min_keep = args.min_keep_s if drop else 0.0
     keep = [(0.0, duration)] if not drop else complement(drop, duration, min_keep)
     if not keep:
-        LOG.warning("   %s: nothing survives a %.0fs minimum", src.name, args.min_keep_s)
-        return [], []
+        # Every frame of this recording is inside a face span (or the leftovers are too short to be
+        # worth keeping). Do NOT return early: fall through so the whole thing is written to removed/
+        # like any other cut footage. A recording discarded in full is the one most worth reviewing,
+        # and leaving no artefact at all would make it simply disappear from the output.
+        LOG.warning("   %s: nothing survives a %.0fs minimum; the whole recording goes to removed/",
+                    src.name, args.min_keep_s)
 
     # Each kept clip must begin on a keyframe or it will not decode. Snap FORWARD to the next one so
     # the clip never reaches back into the removed span.
