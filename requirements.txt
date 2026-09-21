@@ -1,0 +1,15 @@
+# Top-level intent. Exact versions that are known to work together are in requirements.lock.txt.
+# Install order matters (see setup_venv.sh): torch cu126 first, then these, then paddlepaddle-gpu
+# from the Paddle cu126 index, then re-pin torch's nvidia-* libraries.
+torch
+torchvision
+ultralytics>=8.4
+supervision
+paddleocr>=3.7
+paddlepaddle-gpu==3.3.1        # from https://www.paddlepaddle.org.cn/packages/stable/cu126/
+opencv-python==4.10.0.84       # must equal opencv-contrib-python (pinned by paddlex) so both dists ship the same cv2
+opencv-contrib-python==4.10.0.84
+numpy>=2.0,<2.4                # paddlex upper bound
+tqdm
+timm                           # ultralytics SAM3 ViT blocks import timm.layers at build time
+clip @ git+https://github.com/ultralytics/CLIP.git   # SAM3 text tokenizer; ultralytics would pip-install it at runtime otherwise

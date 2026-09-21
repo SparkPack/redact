@@ -1,0 +1,24 @@
+# Model weights: large, and EgoBlur/SAM3 are gated downloads that must not be redistributed.
+# See README.md for where to obtain them.
+weights/
+*.jit
+*.pt
+*.onnx
+*.ts
+
+# Generated outputs and test media
+demo/
+*.mcap
+*.mp4
+*.MOV
+*_faces.json
+mcap_faces*.json
+split_manifest.json
+blur_manifest*.json
+cut_manifest.json
+faces.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
