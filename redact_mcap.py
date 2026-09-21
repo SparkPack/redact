@@ -28,9 +28,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import redact_videos as rv  # noqa: E402
 from detect_faces_mcap import VIDEO_SCHEMA, parse_protobuf_fields  # noqa: E402
-from extract_faces_mcap import is_keyframe  # noqa: E402
 from plan_face_cuts import complement, merge  # noqa: E402
-from split_faces_mcap import McapCopy  # noqa: E402
+from redact_videos import McapCopy, is_keyframe  # noqa: E402
 
 LOG = logging.getLogger("redact")
 SCRIPT_VERSION = "1.0.0"

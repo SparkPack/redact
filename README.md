@@ -13,9 +13,59 @@ Everything runs directly on `.mcap` logs. Video is never extracted to files and 
 decoded from the log, processed, and written back, so timestamps, sequence numbers and all non-video
 channels (IMU, thermal, logs) survive intact.
 
+## Getting started on a fresh Ubuntu box
+
+Tested on Ubuntu 22.04 with two RTX 4090s. You need an NVIDIA GPU with ~8 GB free, driver 560 or
+newer (`nvidia-smi` should report a CUDA version of 12.6+), and about 10 GB of disk for the venv.
+
+**1. Install uv**, the Python package manager the setup script uses:
+
 ```bash
-source ~/sparkpack/.venv-redact/bin/activate
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+**2. Clone and build the environment.** This creates `.venv-redact` alongside the checkout, installs
+CUDA PyTorch, ultralytics, the mcap libraries and a static ffmpeg with NVENC/NVDEC, and verifies them.
+Takes about 10 minutes and downloads several GB:
+
+```bash
+git clone https://github.com/SparkPack/redact.git
+cd redact && ./setup_venv.sh
+```
+
+**3. Get the EgoBlur face model.** It is a gated download, Apache 2.0 licensed, and the pipeline does
+nothing without it:
+
+  1. Go to [projectaria.com/tools/egoblur](https://www.projectaria.com/tools/egoblur) and find
+     "Access the models"
+  2. Enter your email and accept the licence. A download link arrives by email, usually in minutes
+  3. The zip contains `ego_blur_face_gen2.jit` (400 MB)
+
+```bash
+mkdir -p weights && unzip -d weights ~/Downloads/ego_blur_face_gen2.zip
+```
+
+There are two model generations. Gen2 is the default here; both are Apache 2.0. The generation is
+inferred from the filename, so keep the name as shipped.
+
+**4. Activate and check it works:**
+
+```bash
+source ../.venv-redact/bin/activate
+python redact_mcap.py --help
+```
+
+**5. Calibrate `--conf` on your own footage** before trusting any output. See below; do not reuse the
+0.95 from this repo.
+
+### Troubleshooting
+
+| symptom | cause |
+|---|---|
+| `Unknown builtin op: torchvision::nms` | torchvision must be imported before `torch.jit.load`; handled in the code, but means the venv is broken if you see it |
+| `undefined symbol: ncclCommGrow` | something reinstalled PaddlePaddle and downgraded torch's NVIDIA libraries. Re-run step 4 of `setup_venv.sh` |
+| `no foxglove.CompressedVideo channels` | the log has no video, or the writer used a different schema |
+| whole machine freezes | CUDA on the display GPU. Use `--device 1`; see Hardware notes |
 
 ## The two commands
 
@@ -126,33 +176,24 @@ python blur_faces_mcap.py SRC OUT --shard 0 2 --device 0 &
 python blur_faces_mcap.py SRC OUT --shard 1 2 --device 1
 ```
 
-## Weights
-
-`weights/ego_blur_face_gen2.jit` (400 MB) is a gated download from
-[projectaria.com/tools/egoblur](https://www.projectaria.com/tools/egoblur) behind an email form,
-Apache 2.0. EgoBlur is trained on egocentric wearable-camera video, which is what a body-worn rig
-produces, so it substantially beats general-purpose detectors here. YuNet
-(`face_detection_yunet_2023mar.onnx`) is a CPU fallback that is markedly less accurate on this footage.
-
 ## Other tools
 
 | file | purpose |
 |---|---|
-| `detect_faces_mcap.py` | detection only; writes per-frame boxes and intervals |
+| `detect_faces_mcap.py` | detection only; writes per-frame boxes and face intervals |
 | `plan_face_cuts.py` | sweeps cut strategies, reports clip counts and lengths |
 | `blur_faces_mcap.py` | the blur worker, with all its knobs |
 | `mcap_to_mosaic.py` | multi-camera review video |
-| `redact_videos.py` | shared library: detectors, masks, fills, ffmpeg |
-| `tests/test_pipeline.py` | checks that need no gated weights |
-| `README_mp4_pipeline.md` | the earlier MP4-based pipeline (SAM 3 objects, OCR) |
+| `redact_videos.py` | shared library: ffmpeg wrappers, EgoBlur, masks, fills |
+| `tests/test_pipeline.py` | unit checks that need no weights or footage |
 
-## Rebuilding the environment
+## Notes on the environment
 
-```bash
-./setup_venv.sh
-```
+`setup_venv.sh` is idempotent; re-run it to rebuild. The dependency list is deliberately small: torch,
+torchvision, opencv, numpy and the mcap libraries. Two things worth knowing:
 
-Three traps it handles: PaddlePaddle downgrades torch's NVIDIA libraries and breaks it, uv gives
-`--extra-index-url` priority over `--index-url`, and ultralytics pip-installs CLIP and timm at runtime
-which fails in a uv venv. Also note libx264 is the default encoder rather than NVENC: GeForce cards cap
-concurrent NVENC sessions, and at 1920x1200 libx264 measured slightly faster anyway.
+- **torchvision must be imported before `torch.jit.load`**, or the EgoBlur export dies with
+  "Unknown builtin op: torchvision::nms". The library does this; don't reorder it.
+- **libx264 is the default encoder, not NVENC.** GeForce cards cap concurrent NVENC sessions, and
+  exceeding it kills encoders mid-run with a broken pipe once several channels encode at once. At
+  1920x1200 libx264 measured slightly faster anyway (218 vs 206 fps).

@@ -1,41 +1,25 @@
-#!/usr/bin/env python
-"""Batch visual redaction for MP4 folders.
+"""Shared library for the MCAP face-redaction tools.
 
-Per video:
-  1. Decode with ffmpeg (NVDEC when available) to raw BGR frames.
-  2. SAM 3 text-prompted video tracking (SAM3VideoSemanticPredictor) for the
-     configured prompts, plus EgoBlur face detection (TorchScript, gen1 or gen2).
-  3. Union of all masks -> spatial dilation -> temporal smoothing.
-  4. Flat-fill the smoothed mask with a grey value.
-  5. Encode with NVENC (h264/hevc), no audio, to <output_dir>/<stem>.mp4.
-  6. Run PaddleOCR on sampled frames of the *output* to flag remaining readable text.
-  7. Append an entry (SHA-256 of input and output, stats, OCR flags) to manifest.json.
+ffmpeg process wrappers, the EgoBlur TorchScript detector, mask growth and fill, temporal smoothing,
+and small MCAP helpers. There is no command line here; see redact_mcap.py.
 
-The SAM 3 weights (sam3.pt) and EgoBlur weights (*.jit) are gated downloads and
-must be supplied with --sam3-weights / --egoblur-weights.
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import logging
 import os
-import platform
 import queue
-import shutil
 import subprocess
 import sys
 import tempfile
 import threading
-import time
-import traceback
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Iterator
 
 import cv2
 import numpy as np
@@ -306,151 +290,6 @@ class FrameWriter:
 
 
 # --------------------------------------------------------------------------- SAM 3
-class PipeFrameSource:
-    """Duck-types ultralytics' LoadImagesAndVideos for one video fed from a FrameReader.
-
-    SAM3VideoSemanticPredictor needs `.mode == "video"`, `.frames` (used to size per-frame
-    prompt lists) and `.frame` (1-based current index) from the dataset object.
-    """
-
-    def __init__(self, reader: FrameReader, path: Path, est_frames: int, fps: float, max_frames: int | None):
-        from ultralytics.data.loaders import SourceTypes
-
-        self.reader = reader
-        self.path = str(path)
-        self.source_type = SourceTypes(stream=False, screenshot=False, from_img=False, tensor=False)
-        self.mode = "video"
-        self.bs = 1
-        self.fps = fps
-        self.video_flag = [True]
-        # generous margin: ffprobe frame counts can undershoot the decoded count
-        self.frames = est_frames + max(64, est_frames // 10)
-        self.limit = min(self.frames, max_frames) if max_frames else self.frames
-        self.frame = 0  # 1-based index of the frame most recently returned
-        self.count = 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.frame >= self.limit:
-            raise StopIteration
-        f = self.reader.read()
-        if f is None:
-            raise StopIteration
-        self.frame += 1
-        self.count += 1
-        return [self.path], [f], [""]
-
-    def __len__(self):
-        return 1
-
-
-def _install_ultralytics_source_shim() -> None:
-    """Let BasePredictor.setup_source accept a PipeFrameSource unchanged."""
-    import ultralytics.engine.predictor as pred_mod
-
-    if getattr(pred_mod, "_redact_shim_installed", False):
-        return
-    orig = pred_mod.load_inference_source
-
-    def _load(source=None, **kw):
-        if isinstance(source, PipeFrameSource):
-            return source
-        return orig(source=source, **kw)
-
-    pred_mod.load_inference_source = _load
-    pred_mod._redact_shim_installed = True
-
-
-class Sam3Tracker:
-    def __init__(self, weights: Path, prompts: list[str], conf: float, imgsz: int, half: bool, device: str):
-        import torch  # noqa: F401
-        from ultralytics.models.sam import SAM3VideoSemanticPredictor
-
-        _install_ultralytics_source_shim()
-        self.prompts = list(prompts)
-        self.overrides = dict(
-            model=str(weights), task="segment", mode="predict", imgsz=imgsz, conf=conf,
-            quantize=16 if half else None, device=device.replace("cuda:", ""), verbose=False, save=False,
-            show=False, batch=1,
-        )
-        self.predictor = SAM3VideoSemanticPredictor(overrides=self.overrides)
-        self.predictor.setup_model(model=None)  # load now so weight problems fail fast
-        self.version = __import__("ultralytics").__version__
-
-    def reset(self) -> None:
-        # SAM3VideoSemanticPredictor.init_state() is a no-op when inference_state is non-empty,
-        # so clear it before every video to start fresh masklets.
-        self.predictor.inference_state = {}
-        if hasattr(self.predictor, "tracker"):
-            self.predictor.tracker.inference_state = {}
-
-    def run(self, source: PipeFrameSource) -> Iterator:
-        self.reset()
-        return self.predictor(source=source, text=self.prompts, stream=True)
-
-    def union(self, result, height: int, width: int) -> tuple[np.ndarray, list[int]]:
-        return self.union_mask(result, height, width)
-
-    @staticmethod
-    def union_mask(result, height: int, width: int) -> tuple[np.ndarray, list[int]]:
-        """Return (bool HxW union of tracked masks, list of class ids present)."""
-        masks = getattr(result, "masks", None)
-        if masks is None or masks.data.shape[0] == 0:
-            return np.zeros((height, width), dtype=bool), []
-        m = masks.data
-        union = m.any(dim=0) if m.dtype == __import__("torch").bool else (m > 0.5).any(dim=0)
-        cls_ids = result.boxes.cls.int().tolist() if result.boxes is not None else []
-        return union.cpu().numpy(), cls_ids
-
-
-class YoloeTracker:
-    """Fallback object masker: YOLOE open-vocabulary instance segmentation, per frame, same text prompts.
-
-    Stand-in while sam3.pt access is pending. No cross-frame tracking; the temporal smoother
-    handles flicker. Weights (yoloe-*-seg.pt) and the MobileCLIP text encoder auto-download.
-    """
-
-    def __init__(self, weights: Path, prompts: list[str], conf: float, imgsz: int, half: bool, device: str):
-        import contextlib
-
-        from ultralytics import YOLOE
-
-        self.prompts = list(prompts)
-        self.conf, self.imgsz, self.half = conf, imgsz, half
-        self.device = device.replace("cuda:", "")
-        weights = weights.resolve()  # absolute: the chdir below would otherwise re-root a relative path
-        weights.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.chdir(weights.parent):  # ultralytics drops mobileclip_blt.ts into the cwd
-            self.model = YOLOE(str(weights))
-            self.model.set_classes(self.prompts, self.model.get_text_pe(self.prompts))
-            # warm up once so the predictor exists with our settings
-            self.model.predict(np.zeros((64, 64, 3), np.uint8), imgsz=64, verbose=False, device=self.device,
-                               quantize=16 if half else None)
-        self.weights = weights
-        self.version = __import__("ultralytics").__version__
-
-    def run(self, source: "PipeFrameSource") -> Iterator:
-        for _, imgs, _ in source:
-            # retina_masks=False: masks stay at network resolution; upsampling every instance to 1080p inside
-            # ultralytics costs ~15 ms/frame, upsampling our single union costs ~1.5 ms (see union()).
-            yield self.model.predict(imgs[0], conf=self.conf, imgsz=self.imgsz, quantize=16 if self.half else None,
-                                     device=self.device, retina_masks=False, verbose=False)[0]
-
-    @staticmethod
-    def union(result, height: int, width: int) -> tuple[np.ndarray, list[int]]:
-        masks = getattr(result, "masks", None)
-        if masks is None or masks.data.shape[0] == 0:
-            return np.zeros((height, width), dtype=bool), []
-        from ultralytics.utils import ops
-
-        u = masks.data.any(dim=0)[None, None].float()  # letterboxed network-res union
-        u = ops.scale_masks(u, (height, width))[0, 0] > 0.5  # strips letterbox padding, resizes to frame
-        return u.cpu().numpy(), result.boxes.cls.int().tolist()
-
-
-# --------------------------------------------------------------------------- EgoBlur
 def _build_gen2_unwrapper(model):
     """Wrap a detectron2/d2go scripted detector so only plain tensors cross into Python.
 
@@ -820,464 +659,63 @@ class TemporalSmoother:
 
 
 # --------------------------------------------------------------------------- OCR
-class TextFlagger:
-    def __init__(self, lang: str, device: str, min_conf: float, min_chars: int):
-        import paddleocr
-
-        self.min_conf, self.min_chars = min_conf, min_chars
-        self.version = paddleocr.__version__
-        major = int(self.version.split(".")[0])
-        pd_dev = "cpu" if device == "cpu" else "gpu:" + device.replace("cuda:", "")
-        if major >= 3:
-            self.api = 3
-            self.ocr = paddleocr.PaddleOCR(
-                lang=lang, device=pd_dev, use_doc_orientation_classify=False,
-                use_doc_unwarping=False, use_textline_orientation=False,
-            )
-        else:
-            self.api = 2
-            self.ocr = paddleocr.PaddleOCR(lang=lang, use_angle_cls=False, use_gpu=device != "cpu", show_log=False)
-
-    @staticmethod
-    def _readable(text: str, min_chars: int) -> bool:
-        t = text.strip()
-        return len(t) >= min_chars and any(c.isalnum() for c in t)
-
-    def read(self, bgr: np.ndarray) -> list[dict]:
-        hits = []
-        if self.api == 3:
-            for res in self.ocr.predict(bgr):
-                d = res if isinstance(res, dict) else getattr(res, "json", {}).get("res", {})
-                texts = d.get("rec_texts", []) or []
-                scores = d.get("rec_scores", []) or []
-                polys = d.get("rec_polys", None)
-                if polys is None:
-                    polys = d.get("dt_polys", [None] * len(texts))
-                for text, score, poly in zip(texts, scores, polys):
-                    if float(score) >= self.min_conf and self._readable(text, self.min_chars):
-                        box = np.asarray(poly).reshape(-1, 2) if poly is not None else None
-                        hits.append({
-                            "text": text, "score": round(float(score), 4),
-                            "box_xyxy": [int(box[:, 0].min()), int(box[:, 1].min()), int(box[:, 0].max()), int(box[:, 1].max())] if box is not None else None,
-                        })
-        else:
-            res = self.ocr.ocr(bgr, cls=False) or []
-            for page in res:
-                for item in page or []:
-                    poly, (text, score) = item
-                    if float(score) >= self.min_conf and self._readable(text, self.min_chars):
-                        box = np.asarray(poly).reshape(-1, 2)
-                        hits.append({"text": text, "score": round(float(score), 4),
-                                     "box_xyxy": [int(box[:, 0].min()), int(box[:, 1].min()), int(box[:, 0].max()), int(box[:, 1].max())]})
-        return hits
 
 
-# --------------------------------------------------------------------------- pipeline
-@dataclass
-class VideoReport:
-    input: dict
-    output: dict | None = None
-    redaction: dict | None = None
-    ocr: dict | None = None
-    timing: dict = field(default_factory=dict)
-    status: str = "pending"
-    error: str | None = None
+# --------------------------------------------------------------------------- mcap helpers
+def is_keyframe(pkt: bytes) -> bool:
+    """True if this h264 access unit contains an IDR slice (NAL type 5).
+
+    A clip must begin on one or it will not decode, so cut boundaries are snapped to these.
+    """
+    i, n = 0, len(pkt)
+    while i < n - 3:
+        if pkt[i] == 0 and pkt[i + 1] == 0:
+            if pkt[i + 2] == 1:
+                if (pkt[i + 3] & 0x1F) == 5:
+                    return True
+                i += 3
+                continue
+            if pkt[i + 2] == 0 and i + 4 < n and pkt[i + 3] == 1:
+                if (pkt[i + 4] & 0x1F) == 5:
+                    return True
+                i += 4
+                continue
+        i += 1
+    return False
 
 
-def process_video(args, tools: FFTools, info: VideoInfo, out_path: Path, sam3: Sam3Tracker | None,
-                  faces: FaceDetector | None, ocr: TextFlagger | None, gpu_index: int | None, codec: str) -> VideoReport:
-    from tqdm import tqdm
+class McapCopy:
+    """Incremental MCAP writer that mirrors schemas and channels from a source file on demand."""
 
-    src = Path(info.path)
-    report = VideoReport(input={**asdict(info), "sha256": None})
-    t0 = time.time()
-    report.input["sha256"] = sha256_file(src)
-    report.timing["sha256_input_s"] = round(time.time() - t0, 2)
+    def __init__(self, path: Path, library: str):
+        from mcap.writer import Writer
 
-    W, H = info.display_width, info.display_height  # decoder pipe delivers display orientation
-    if info.rotation:
-        LOG.info("%s: rotation tag %d° -> processing upright at %dx%d", src.name, info.rotation, W, H)
-    smoother = TemporalSmoother(args.smooth_window, args.smooth_mode)
-    tint = tint_from_seed(report.input["sha256"] + str(args.anon_seed)) if args.fill == "anon" else None
-    use_cuda_dec = tools.hwaccel_cuda and not args.no_gpu_decode
+        self.path = path
+        self.fh = open(path, "wb")
+        self.w = Writer(self.fh)
+        self.w.start(profile="", library=library)
+        self._schemas: dict = {}
+        self._channels: dict = {}
+        self.count = 0
 
-    stats = dict(
-        frames=0, frames_with_objects=0, frames_with_faces=0, max_faces_in_frame=0, total_face_detections=0,
-        frames_redacted=0, mean_masked_fraction=0.0, max_masked_fraction=0.0,
-        per_prompt_frames={p: 0 for p in (sam3.prompts if sam3 else [])},
-    )
-    masked_frac_sum = 0.0
-    partial = out_path.with_name(out_path.stem + ".partial.mp4")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    reader = FrameReader(tools, src, W, H, use_cuda_dec, gpu_index)
-    writer = FrameWriter(tools, partial, W, H, info.fps, codec, args.nvenc_preset, args.cq, gpu_index)
-    t1 = time.time()
-    dec_err = ""
-    try:
-        source = PipeFrameSource(reader, src, info.nb_frames, info.fps_float, args.max_frames)
-        if sam3 is not None:
-            results = sam3.run(source)
+    def add(self, schema, channel, msg) -> None:
+        key = (channel.topic, channel.message_encoding, schema.name if schema else "")
+        if key not in self._channels:
+            sid = 0
+            if schema is not None:
+                skey = (schema.name, schema.encoding, bytes(schema.data))
+                if skey not in self._schemas:
+                    self._schemas[skey] = self.w.register_schema(
+                        name=schema.name, encoding=schema.encoding, data=schema.data)
+                sid = self._schemas[skey]
+            self._channels[key] = self.w.register_channel(
+                topic=channel.topic, message_encoding=channel.message_encoding,
+                schema_id=sid, metadata=dict(channel.metadata or {}))
+        self.w.add_message(channel_id=self._channels[key], log_time=msg.log_time,
+                           data=msg.data, publish_time=msg.publish_time, sequence=msg.sequence)
+        self.count += 1
 
-            def frame_iter():
-                for r in results:
-                    union, cls_ids = sam3.union(r, H, W)
-                    yield r.orig_img, union, cls_ids
-        else:
-            def frame_iter():
-                for _, imgs, _ in source:
-                    yield imgs[0], np.zeros((H, W), dtype=bool), []
-
-        # Stage 2 (worker thread): faces -> dilate -> temporal smoothing -> fill -> encoder.
-        # Stage 1 (this thread): decode read -> object model -> union mask. Overlapping the two hides
-        # the CPU post-processing behind GPU inference; cv2/numpy release the GIL.
-        post_q: queue.Queue = queue.Queue(maxsize=48)
-        post_exc: list[BaseException] = []
-        masked = {"sum": 0.0}
-
-        def emit(items):
-            for _, frame, sm in items:
-                frac = float(np.count_nonzero(sm)) / sm.size
-                masked["sum"] += frac
-                if frac > 0:
-                    stats["frames_redacted"] += 1
-                    stats["max_masked_fraction"] = max(stats["max_masked_fraction"], frac)
-                    frame = apply_fill(frame, sm.view(np.uint8), args.fill, args.grey, args.blur_block, tint)
-                writer.write(frame)
-
-        def post_worker():
-            try:
-                for idx, frame, mask in iter(post_q.get, None):
-                    if faces is not None:
-                        boxes = faces.detect(frame)
-                        if len(boxes):
-                            stats["frames_with_faces"] += 1
-                            stats["total_face_detections"] += int(len(boxes))
-                            stats["max_faces_in_frame"] = max(stats["max_faces_in_frame"], int(len(boxes)))
-                            paint_faces(mask, boxes, args.face_shape)
-                    mask = dilate_fast(mask, args.dilate_px)
-                    emit(smoother.push(idx, frame, mask))
-                emit(smoother.flush())
-            except BaseException as e:  # noqa: BLE001
-                post_exc.append(e)
-                while True:  # drain so the producer never blocks on a dead consumer
-                    if post_q.get() is None:
-                        break
-
-        worker = threading.Thread(target=post_worker, daemon=True)
-        worker.start()
-        pbar = tqdm(total=source.limit if args.max_frames else info.nb_frames, unit="f", desc=src.name, leave=False, dynamic_ncols=True)
-        for idx, (frame, union, cls_ids) in enumerate(frame_iter()):
-            if post_exc:
-                raise RuntimeError(f"post-processing failed: {post_exc[0]!r}") from post_exc[0]
-            if cls_ids:
-                stats["frames_with_objects"] += 1
-                for c in set(cls_ids):
-                    if 0 <= c < len(sam3.prompts):
-                        stats["per_prompt_frames"][sam3.prompts[c]] += 1
-            stats["frames"] += 1
-            post_q.put((idx, frame, union.view(np.uint8).copy()))
-            pbar.update(1)
-        post_q.put(None)
-        worker.join()
-        pbar.close()
-        if post_exc:
-            raise RuntimeError(f"post-processing failed: {post_exc[0]!r}") from post_exc[0]
-        masked_frac_sum = masked["sum"]
-    except BaseException:
-        writer.abort()
-        partial.unlink(missing_ok=True)
-        raise
-    finally:
-        dec_err = reader.close()
-    enc_err = writer.close()
-    if dec_err and not (args.max_frames and "Broken pipe" in dec_err):  # we close the pipe early on --max-frames
-        LOG.warning("%s: decoder stderr: %s", src.name, dec_err[-500:])
-    if enc_err:
-        LOG.warning("%s: encoder stderr: %s", src.name, enc_err[-500:])
-    if stats["frames"] == 0:
-        partial.unlink(missing_ok=True)
-        raise RuntimeError(f"no frames decoded from {src} ({dec_err[-300:]})")
-    if writer.frames_written != stats["frames"]:
-        raise RuntimeError(f"frame count mismatch: processed {stats['frames']} wrote {writer.frames_written}")
-    report.timing["redact_s"] = round(time.time() - t1, 2)
-    report.timing["redact_fps"] = round(stats["frames"] / max(1e-6, time.time() - t1), 2)
-    stats["mean_masked_fraction"] = round(masked_frac_sum / stats["frames"], 6)
-    stats["max_masked_fraction"] = round(stats["max_masked_fraction"], 6)
-    os.replace(partial, out_path)
-
-    out_info = ffprobe_video(tools, out_path)
-    t2 = time.time()
-    report.output = {**asdict(out_info), "sha256": sha256_file(out_path), "encoder": codec,
-                     "audio": "stripped", "gpu_decode": use_cuda_dec}
-    report.timing["sha256_output_s"] = round(time.time() - t2, 2)
-    if out_info.nb_frames != stats["frames"]:
-        LOG.warning("%s: output has %d frames, processed %d", out_path.name, out_info.nb_frames, stats["frames"])
-    report.redaction = {
-        "prompts": sam3.prompts if sam3 else [],
-        "objects_enabled": sam3 is not None, "object_tracker": args.tracker if sam3 else None,
-        "faces_enabled": faces is not None, "face_detector": args.face_detector if faces else None,
-        "dilate_px": args.dilate_px, "smooth_window": args.smooth_window, "smooth_mode": args.smooth_mode,
-        "fill": args.fill, "fill_bgr": [int(args.grey)] * 3 if args.fill == "grey" else None,
-        "blur_block": args.blur_block if args.fill != "grey" else None,
-        "anon_tint_bgr": list(tint) if tint else None, **stats,
-    }
-
-    # OCR pass on the encoded output
-    if ocr is not None:
-        t3 = time.time()
-        flags = []
-        checked = 0
-        rd = FrameReader(tools, out_path, out_info.display_width, out_info.display_height, use_cuda_dec, gpu_index,
-                         select_stride=args.ocr_stride)
-        try:
-            i = 0
-            while True:
-                f = rd.read()
-                if f is None:
-                    break
-                fidx = i * args.ocr_stride
-                i += 1
-                checked += 1
-                hits = ocr.read(f)
-                if hits:
-                    flags.append({"frame": fidx, "time_s": round(fidx / out_info.fps_float, 3), "texts": hits})
-        finally:
-            rd.close()
-        report.ocr = {
-            "engine": f"paddleocr {ocr.version}", "lang": args.ocr_lang, "stride": args.ocr_stride,
-            "min_conf": args.ocr_min_conf, "min_chars": args.ocr_min_chars,
-            "frames_checked": checked, "frames_flagged": len(flags),
-            "distinct_texts": sorted({h["text"] for fl in flags for h in fl["texts"]}),
-            "flags": flags,
-        }
-        report.timing["ocr_s"] = round(time.time() - t3, 2)
-    report.timing["total_s"] = round(time.time() - t0, 2)
-    report.status = "ok"
-    return report
-
-
-# --------------------------------------------------------------------------- main
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("input_dir", type=Path)
-    p.add_argument("output_dir", type=Path)
-    p.add_argument("--recursive", action="store_true", help="descend into sub-folders (outputs are flattened by stem)")
-    p.add_argument("--overwrite", action="store_true", help="re-process videos whose output already exists")
-    p.add_argument("--max-frames", type=int, default=None, help="debug: stop after N frames per video")
-    p.add_argument("--shard", nargs=2, type=int, metavar=("I", "N"), default=None,
-                   help="process only files with index %% N == I (run one shard per GPU)")
-    p.add_argument("--list", action="store_true", help="probe and list the videos that would be processed, then exit")
-
-    g = p.add_argument_group("models")
-    g.add_argument("--tracker", choices=["sam3", "yoloe"], default="sam3",
-                   help="object masker: sam3 (SAM3VideoSemanticPredictor, needs gated sam3.pt) or yoloe "
-                        "(open-vocabulary YOLOE segmentation fallback, weights auto-download)")
-    g.add_argument("--sam3-weights", type=Path, default=Path("sam3.pt"))
-    g.add_argument("--yoloe-weights", type=Path, default=Path("weights/yoloe-11l-seg.pt"),
-                   help="yoloe-{v8s,v8m,v8l,11s,11m,11l,26n..26x}-seg.pt; downloaded to this path if missing")
-    g.add_argument("--yoloe-imgsz", type=int, default=1280, help="YOLOE inference size (long side)")
-    g.add_argument("--yoloe-conf", type=float, default=0.15,
-                   help="YOLOE score threshold (its open-vocabulary scores run lower than SAM 3's; "
-                        "concrete nouns like 'box', 'soda can', 'person' score far better than 'label' or 'wrapper')")
-    g.add_argument("--face-detector", choices=["egoblur", "yunet"], default="egoblur",
-                   help="egoblur (gated TorchScript weights) or yunet (OpenCV fallback, auto-downloads 230 KB ONNX)")
-    g.add_argument("--egoblur-weights", type=Path, default=None, help="EgoBlur face TorchScript (.jit)")
-    g.add_argument("--yunet-weights", type=Path, default=Path("weights/face_detection_yunet_2023mar.onnx"))
-    g.add_argument("--yunet-scale", type=float, default=0.5, help="downscale factor for YuNet input (speed)")
-    g.add_argument("--egoblur-gen", choices=["auto", "1", "2"], default="auto")
-    g.add_argument("--prompts", nargs="+", default=DEFAULT_PROMPTS, help="SAM 3 text prompts")
-    g.add_argument("--conf", type=float, default=0.3, help="SAM 3 mask confidence threshold")
-    g.add_argument("--imgsz", type=int, default=1008, help="SAM 3 inference size (multiple of 14)")
-    g.add_argument("--no-half", action="store_true", help="run SAM 3 in fp32")
-    g.add_argument("--face-conf", type=float, default=0.5)
-    g.add_argument("--face-nms", type=float, default=0.3)
-    g.add_argument("--face-scale", type=float, default=1.15, help="enlarge face boxes about their centre")
-    g.add_argument("--face-shape", choices=["rect", "ellipse"], default="rect")
-    g.add_argument("--no-sam3", action="store_true")
-    g.add_argument("--no-faces", action="store_true")
-    g.add_argument("--device", default="0", help="cpu, N or cuda:N (torch, paddle, NVDEC and NVENC all use it)")
-
-    g = p.add_argument_group("mask post-processing")
-    g.add_argument("--dilate-px", type=int, default=15,
-                   help="mask margin in px: >0 grows the mask outward (safer), <0 shrinks it inward so the object's "
-                        "edges stay sharp and only its interior is redacted, 0 = as detected")
-    g.add_argument("--smooth-window", type=int, default=5, help="odd temporal window (frames)")
-    g.add_argument("--smooth-mode", choices=["max", "majority"], default="max",
-                   help="max = hold (never shrinks coverage); majority = vote")
-    g.add_argument("--fill", choices=["grey", "blur", "pixelate", "anon"], default="grey",
-                   help="grey = flat fill (irreversible); blur = strong blur; pixelate = mosaic; anon = blur + "
-                        "replace the object's colours with a per-video random tint while keeping its shading "
-                        "(geometry-preserving anonymisation for training data). Only grey guarantees text is "
-                        "unrecoverable.")
-    g.add_argument("--anon-seed", default="", help="extra seed for the anon tint (tint is derived from input sha256 + seed)")
-    g.add_argument("--grey", type=int, default=128, help="fill value 0-255 for all three channels (grey mode)")
-    g.add_argument("--blur-block", type=int, default=24,
-                   help="blur/pixelate coarseness in pixels at 1080p (frame is downscaled by this factor)")
-
-    g = p.add_argument_group("encoding")
-    g.add_argument("--codec", choices=["h264_nvenc", "hevc_nvenc", "libx264", "libx265"], default="h264_nvenc")
-    g.add_argument("--nvenc-preset", default="p5", help="NVENC preset p1 (fast) .. p7 (quality)")
-    g.add_argument("--cq", type=int, default=23, help="NVENC constant-quality level (or CRF for libx26x)")
-    g.add_argument("--no-gpu-decode", action="store_true", help="disable NVDEC (-hwaccel cuda)")
-    g.add_argument("--ffmpeg", default=None)
-    g.add_argument("--ffprobe", default=None)
-
-    g = p.add_argument_group("OCR check")
-    g.add_argument("--no-ocr", action="store_true")
-    g.add_argument("--ocr-stride", type=int, default=15, help="check every Nth output frame")
-    g.add_argument("--ocr-lang", default="en")
-    g.add_argument("--ocr-min-conf", type=float, default=0.6)
-    g.add_argument("--ocr-min-chars", type=int, default=3)
-
-    g = p.add_argument_group("manifest")
-    g.add_argument("--manifest", default=None, help="manifest file name inside output_dir (default manifest.json)")
-    return p
-
-
-def find_videos(root: Path, recursive: bool) -> list[Path]:
-    it = root.rglob("*") if recursive else root.iterdir()
-    vids = sorted(p for p in it if p.is_file() and p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("."))
-    return vids
-
-
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
-    torch_dev, gpu_index = parse_device(args.device)
-    if not args.input_dir.is_dir():
-        sys.exit(f"error: input_dir {args.input_dir} is not a directory (pass the folder that holds your MP4s)")
-    if not args.no_sam3 and args.tracker == "sam3" and not args.sam3_weights.is_file():
-        sys.exit(f"error: SAM 3 weights not found at {args.sam3_weights}; pass --sam3-weights /real/path/sam3.pt "
-                 "or --no-sam3 to run without it")
-    if not args.no_faces and args.face_detector == "egoblur" and (args.egoblur_weights is None or not args.egoblur_weights.is_file()):
-        sys.exit(f"error: EgoBlur weights not found at {args.egoblur_weights}; pass --egoblur-weights /real/path/*.jit "
-                 "or --no-faces to run without it")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[logging.StreamHandler(sys.stderr), logging.FileHandler(args.output_dir / "redact.log")])
-    tools = FFTools.discover(args.ffmpeg, args.ffprobe)
-    LOG.info("ffmpeg: %s (cuda hwaccel=%s)", tools.version, tools.hwaccel_cuda)
-
-    codec = args.codec
-    if codec.endswith("_nvenc") and codec not in tools.encoders:
-        LOG.warning("%s not available in this ffmpeg; falling back to libx264", codec)
-        codec = "libx264"
-    if codec.endswith("_nvenc") and gpu_index is None:
-        LOG.warning("--device cpu with NVENC: encoder will use GPU 0")
-
-    vids = find_videos(args.input_dir, args.recursive)
-    if args.shard:
-        i, n = args.shard
-        vids = [v for k, v in enumerate(vids) if k % n == i]
-    if not vids:
-        LOG.error("no videos found in %s", args.input_dir)
-        return 2
-    if args.list:
-        for v in vids:
-            inf = ffprobe_video(tools, v)
-            rot = f" rot{inf.rotation}->{inf.display_width}x{inf.display_height}" if inf.rotation else ""
-            print(f"{v}  {inf.width}x{inf.height}{rot} {inf.fps_float:.3f}fps {inf.nb_frames}f {inf.codec}")
-        return 0
-
-    manifest_name = args.manifest or ("manifest.json" if not args.shard else f"manifest_shard{args.shard[0]}of{args.shard[1]}.json")
-    manifest_path = args.output_dir / manifest_name
-    manifest = {"schema": "sparkpack-redact/1", "created_utc": utc_now(), "videos": []}
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text())
-            LOG.info("resuming manifest %s (%d entries)", manifest_path, len(manifest.get("videos", [])))
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("could not parse existing manifest (%s); starting new", e)
-            manifest = {"schema": "sparkpack-redact/1", "created_utc": utc_now(), "videos": []}
-    by_input = {e["input"]["path"]: e for e in manifest["videos"]}
-
-    # models
-    sam3 = faces = ocr = None
-    import torch
-
-    gpu_name = torch.cuda.get_device_name(gpu_index) if gpu_index is not None and torch.cuda.is_available() else None
-    if not args.no_sam3:
-        t = time.time()
-        if args.tracker == "yoloe":
-            sam3 = YoloeTracker(args.yoloe_weights, args.prompts, args.yoloe_conf, args.yoloe_imgsz, not args.no_half, torch_dev)
-            LOG.info("YOLOE fallback loaded (%.1fs) %s prompts=%s", time.time() - t, args.yoloe_weights.name, args.prompts)
-        else:
-            sam3 = Sam3Tracker(args.sam3_weights, args.prompts, args.conf, args.imgsz, not args.no_half, torch_dev)
-            LOG.info("SAM 3 loaded (%.1fs) prompts=%s", time.time() - t, args.prompts)
-    if not args.no_faces:
-        if args.face_detector == "yunet":
-            faces = YuNetFaceDetector(args.yunet_weights, args.face_conf, args.face_nms, args.face_scale, args.yunet_scale)
-            LOG.info("YuNet face fallback loaded (%s, input scale %.2f)", args.yunet_weights.name, args.yunet_scale)
-        else:
-            faces = FaceDetector(args.egoblur_weights, torch_dev, args.egoblur_gen, args.face_conf, args.face_nms, args.face_scale)
-            LOG.info("EgoBlur gen%d loaded (%s)", faces.gen, "scripted" if faces.scripted else "traced")
-    if not args.no_ocr:
-        t = time.time()
-        ocr = TextFlagger(args.ocr_lang, torch_dev, args.ocr_min_conf, args.ocr_min_chars)
-        LOG.info("PaddleOCR %s loaded (%.1fs)", ocr.version, time.time() - t)
-
-    manifest["updated_utc"] = utc_now()
-    manifest["tool"] = {
-        "script": Path(__file__).name, "script_version": SCRIPT_VERSION, "script_sha256": sha256_file(Path(__file__)),
-        "python": platform.python_version(), "torch": torch.__version__, "cuda": torch.version.cuda,
-        "ultralytics": sam3.version if sam3 else None, "paddleocr": ocr.version if ocr else None,
-        "opencv": cv2.__version__, "ffmpeg": tools.version, "gpu": gpu_name, "host": platform.node(),
-    }
-    manifest["params"] = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
-    manifest["params"]["codec_used"] = codec
-    manifest["weights"] = {
-        "objects": ({"tracker": args.tracker, "path": str(sam3.weights if args.tracker == "yoloe" else args.sam3_weights),
-                     "sha256": sha256_file(sam3.weights if args.tracker == "yoloe" else args.sam3_weights)} if sam3 else None),
-        "faces": {"detector": args.face_detector, "path": str(faces.weights), "sha256": sha256_file(faces.weights)} if faces else None,
-    }
-
-    n_ok = n_err = n_skip = 0
-    for k, v in enumerate(vids, 1):
-        out_path = args.output_dir / (v.stem + ".mp4")
-        if out_path.resolve() == v.resolve():
-            LOG.error("refusing to overwrite input %s (output_dir must differ from input_dir)", v)
-            n_err += 1
-            continue
-        if out_path.exists() and not args.overwrite and str(v) in by_input and by_input[str(v)].get("status") == "ok":
-            LOG.info("[%d/%d] skip %s (already in manifest)", k, len(vids), v.name)
-            n_skip += 1
-            continue
-        LOG.info("[%d/%d] %s", k, len(vids), v)
-        try:
-            info = ffprobe_video(tools, v)
-            rep = process_video(args, tools, info, out_path, sam3, faces, ocr, gpu_index, codec)
-            n_ok += 1
-            LOG.info("  ok: %d frames, %.1f fps, redacted %d frames (mean masked %.2f%%), faces in %d frames, OCR flags %s",
-                     rep.redaction["frames"], rep.timing["redact_fps"], rep.redaction["frames_redacted"],
-                     100 * rep.redaction["mean_masked_fraction"], rep.redaction["frames_with_faces"],
-                     rep.ocr["frames_flagged"] if rep.ocr else "n/a")
-        except Exception as e:  # noqa: BLE001
-            n_err += 1
-            LOG.error("  FAILED %s: %s", v.name, e)
-            LOG.debug(traceback.format_exc())
-            rep = VideoReport(input={"path": str(v)}, status="error", error=f"{type(e).__name__}: {e}")
-            for junk in args.output_dir.glob(v.stem + ".partial.mp4"):
-                junk.unlink(missing_ok=True)
-        entry = asdict(rep)
-        entry["processed_utc"] = utc_now()
-        by_input[str(v)] = entry
-        manifest["videos"] = [by_input[p] for p in sorted(by_input)]
-        manifest["updated_utc"] = utc_now()
-        manifest["summary"] = {
-            "videos": len(manifest["videos"]),
-            "ok": sum(e["status"] == "ok" for e in manifest["videos"]),
-            "error": sum(e["status"] == "error" for e in manifest["videos"]),
-            "ocr_flagged_videos": sum(1 for e in manifest["videos"] if e.get("ocr") and e["ocr"]["frames_flagged"] > 0),
-        }
-        atomic_write_json(manifest_path, manifest)
-        # sha256sum-compatible list of outputs
-        with open(args.output_dir / "SHA256SUMS", "w") as f:
-            for e in manifest["videos"]:
-                if e.get("output"):
-                    f.write(f"{e['output']['sha256']}  {Path(e['output']['path']).name}\n")
-    (args.output_dir / (manifest_name + ".sha256")).write_text(f"{sha256_file(manifest_path)}  {manifest_name}\n")
-    LOG.info("done: %d ok, %d failed, %d skipped -> %s", n_ok, n_err, n_skip, manifest_path)
-    return 1 if n_err else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    def close(self) -> int:
+        self.w.finish()
+        self.fh.close()
+        return self.count

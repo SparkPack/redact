@@ -157,7 +157,7 @@ def main(argv=None) -> int:
     ap.add_argument("--every", type=int, default=1,
                     help="keep every Nth output frame: an N-times-shorter timelapse for quick review. "
                          "A 33-minute recording at --every 6 becomes a 5.5-minute video. Note this speeds "
-                         "RENDERING only modestly (~35%), because every source frame must still be decoded "
+                         "RENDERING only modestly (~35%%), because every source frame must still be decoded "
                          "for h264 inter-frame dependencies; it mainly saves your viewing time.")
     ap.add_argument("--codec", default="h264_nvenc", help="h264_nvenc, hevc_nvenc or libx264")
     ap.add_argument("--nvenc-preset", default="p5")
