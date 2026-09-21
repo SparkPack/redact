@@ -212,11 +212,14 @@ def main(argv=None) -> int:
               else run_detection(a.input, a.output / "faces.json", a))
     by = {Path(f["file"]).name: f for f in report["files"]}
     LOG.info("cut mode, conf %.2f, minimum clip %.0fs", a.conf, a.min_keep_s)
-    records = []
+    records, skipped = [], []
     for src in srcs:
         e = by.get(src.name)
         if e is None or e.get("status") != "ok":
-            LOG.warning("   %s: not in the detection report, skipped", src.name)
+            LOG.error("   %s: detection produced no usable report for this file, so it was NOT cut "
+                      "(the source may be truncated - check that it has a readable MCAP footer)",
+                      src.name)
+            skipped.append(src.name)
             continue
         clips, removed = cut_one(src, a.output, e, a)
         kept = sum(c["duration_s"] for c in clips)
@@ -228,6 +231,7 @@ def main(argv=None) -> int:
     # Recordings are cut one invocation at a time, so merge into whatever is already here instead of
     # replacing it: writing only this run's records would erase the history of every file cut before.
     # Keyed by filename, so re-cutting a recording replaces its record rather than duplicating it.
+    this_run = {r["file"] for r in records}
     if man.exists():
         try:
             prior = json.loads(man.read_text()).get("files", [])
@@ -247,10 +251,17 @@ def main(argv=None) -> int:
                     "source_s": round(sum(r["duration_s"] for r in records), 1)},
     })
     for r in records:
+        if r["file"] not in this_run:
+            continue                      # merged in from an earlier invocation, not cut just now
         LOG.info("%s: %d clip(s) kept %.0fs of %.0fs (%.0f%%), %d removed span(s) totalling %.0fs",
                  r["file"], len(r["clips"]), r["kept_s"], r["duration_s"], r["kept_pct"],
                  len(r["removed"]), r["removed_s"])
     LOG.info("manifest: %s", man)
+    if skipped:
+        # Exit non-zero so a caller looping over files cannot mistake "nothing was cut" for success.
+        # A redaction tool that reports OK for footage it never examined is the worst failure it has.
+        LOG.error("%d file(s) were NOT cut: %s", len(skipped), ", ".join(skipped))
+        return 1
     return 0
 
 
