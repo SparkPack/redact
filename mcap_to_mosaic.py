@@ -70,6 +70,21 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
             times[channel.topic].append(msg.log_time / 1e9)
             fmts[channel.topic].add(f.get(4, b"h264").decode())
 
+    # Each channel's own first IDR can sit up to a GOP (~1 s) into the excerpt, because the five
+    # cameras' keyframes fall milliseconds apart and a cut can only start on one instant. The leading
+    # packets before it reference frames that are gone, so drop them: ffmpeg cannot open the stream
+    # otherwise, and it could not report a frame size either. packets[] and times[] are consumed in
+    # lockstep by the render loop, so both are trimmed together.
+    for t in topics:
+        first = next((i for i, p in enumerate(packets[t]) if rv.is_keyframe(p)), None)
+        if first is None:
+            raise RuntimeError(f"{t}: no keyframe anywhere in {len(packets[t])} packets, so this feed "
+                               f"cannot be decoded at all")
+        if first:
+            LOG.info("  %s: dropping %d packet(s) before the first keyframe", t, first)
+            packets[t] = packets[t][first:]
+            times[t] = times[t][first:]
+
     t0 = min(v[0] for v in times.values() if v)
     t1 = max(v[-1] for v in times.values() if v)
     fps = args.fps or round(max((len(v) - 1) / (v[-1] - v[0]) for v in times.values() if len(v) > 1), 3)
@@ -83,11 +98,9 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
         try:
             w, h = probe_stream(tools, packets[t][:8], codec)
         except Exception as e:  # noqa: BLE001
-            # Usually means this channel's excerpt starts mid-GOP, so ffmpeg cannot open it.
-            raise RuntimeError(f"{t}: cannot determine frame size - does this clip start on a "
-                               f"keyframe? ({e})") from e
+            raise RuntimeError(f"{t}: cannot determine frame size ({e})") from e
         if not w or not h:
-            raise RuntimeError(f"{t}: ffmpeg reported a {w}x{h} frame; the clip likely starts mid-GOP")
+            raise RuntimeError(f"{t}: ffmpeg reported a {w}x{h} frame despite starting on a keyframe")
         dims[t] = (w, h)
         decs[t] = PacketDecoder(tools, codec, w, h, 1.0, False, None)
         threading.Thread(target=_feed, args=(decs[t], packets[t]), daemon=True).start()
