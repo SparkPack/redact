@@ -60,10 +60,14 @@ def cut_one(src: Path, out_dir: Path, entry: dict, args) -> list:
         off = c["start_log_time"] - t0
         raw += [[off + a, off + b] for a, b in c["intervals_rel_s"]]
     drop = merge([[max(0.0, a - args.pad_s), b + args.pad_s] for a, b in raw], args.merge_s)
-    keep = complement(drop, duration, args.min_keep_s)
+    # --min-keep-s exists to stop CUTTING leaving useless fragments behind. When there is no face
+    # anywhere, nothing is being cut, so applying it would silently discard a perfectly clean
+    # recording for being short. Six of the card_1 recordings are under 30 s and all are face-free.
+    min_keep = args.min_keep_s if drop else 0.0
+    keep = [(0.0, duration)] if not drop else complement(drop, duration, min_keep)
     if not keep:
         LOG.warning("   %s: nothing survives a %.0fs minimum", src.name, args.min_keep_s)
-        return []
+        return [], []
 
     # Each kept clip must begin on a keyframe or it will not decode. Snap FORWARD to the next one so
     # the clip never reaches back into the removed span.
@@ -95,7 +99,7 @@ def cut_one(src: Path, out_dir: Path, entry: dict, args) -> list:
                 start = min(start, prior[-1])
         if start < a:                      # never reach back into the removed span
             start = nxt
-        if b - start >= args.min_keep_s:
+        if b - start >= min_keep:
             snapped.append((start, b))
     LOG.info("   %s: %d clip(s) %s", src.name, len(snapped),
              [[round(a, 1), round(b, 1)] for a, b in snapped])
@@ -221,6 +225,18 @@ def main(argv=None) -> int:
                         "removed_s": round(sum(c["duration_s"] for c in removed), 1),
                         "kept_pct": round(100 * kept / max(e["duration_s"], 1e-9), 1)})
     man = a.output / "cut_manifest.json"
+    # Recordings are cut one invocation at a time, so merge into whatever is already here instead of
+    # replacing it: writing only this run's records would erase the history of every file cut before.
+    # Keyed by filename, so re-cutting a recording replaces its record rather than duplicating it.
+    if man.exists():
+        try:
+            prior = json.loads(man.read_text()).get("files", [])
+        except (OSError, ValueError) as e:
+            LOG.warning("could not read existing manifest (%s); it will be replaced", e)
+            prior = []
+        fresh = {r["file"] for r in records}
+        records = [r for r in prior if r["file"] not in fresh] + records
+        records.sort(key=lambda r: r["file"])
     rv.atomic_write_json(man, {
         "schema": "sparkpack-redact-cut/1", "created_utc": rv.utc_now(),
         "script_version": SCRIPT_VERSION,
