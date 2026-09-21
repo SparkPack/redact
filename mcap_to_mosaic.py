@@ -80,7 +80,14 @@ def render(path: Path, out: Path, args, tools: rv.FFTools) -> dict:
     decs, dims = {}, {}
     for t in topics:
         codec = "hevc" if "h265" in fmts[t] else "h264"
-        w, h = probe_stream(tools, packets[t][:8], codec)
+        try:
+            w, h = probe_stream(tools, packets[t][:8], codec)
+        except Exception as e:  # noqa: BLE001
+            # Usually means this channel's excerpt starts mid-GOP, so ffmpeg cannot open it.
+            raise RuntimeError(f"{t}: cannot determine frame size - does this clip start on a "
+                               f"keyframe? ({e})") from e
+        if not w or not h:
+            raise RuntimeError(f"{t}: ffmpeg reported a {w}x{h} frame; the clip likely starts mid-GOP")
         dims[t] = (w, h)
         decs[t] = PacketDecoder(tools, codec, w, h, 1.0, False, None)
         threading.Thread(target=_feed, args=(decs[t], packets[t]), daemon=True).start()
@@ -170,6 +177,9 @@ def main(argv=None) -> int:
     _, args.gpu_index = rv.parse_device(args.device)
     tools = rv.FFTools.discover(args.ffmpeg, args.ffprobe)
 
+    if not args.input.exists():
+        sys.exit(f"error: {args.input} does not exist. Pass a real .mcap file or a folder of them, "
+                 f"e.g. ~/cocoapack/card_1/cut/removed")
     if args.input.is_dir():
         files = sorted(args.input.glob("*.mcap"))
         args.output.mkdir(parents=True, exist_ok=True)

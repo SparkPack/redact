@@ -79,10 +79,22 @@ def cut_one(src: Path, out_dir: Path, entry: dict, args) -> list:
                 kf[channel.topic].append(msg.log_time / 1e9 - t0)
     snapped = []
     for a, b in keep:
-        start = a
-        for t in vt:                       # latest next-keyframe, so every camera decodes
+        # Two steps, and the second matters. First take the LATEST next-keyframe across cameras, so the
+        # clip begins at or after every camera's GOP boundary. But the cameras' keyframes are a few
+        # milliseconds apart, so cutting exactly there drops the earlier ones and those channels start
+        # mid-GOP and will not decode. So then step BACK to the earliest keyframe of that same GOP,
+        # which includes all five.
+        nxt = a
+        for t in vt:
             later = [k for k in kf[t] if k >= a]
-            start = max(start, later[0] if later else b)
+            nxt = max(nxt, later[0] if later else b)
+        start = nxt
+        for t in vt:
+            prior = [k for k in kf[t] if k <= nxt]
+            if prior:
+                start = min(start, prior[-1])
+        if start < a:                      # never reach back into the removed span
+            start = nxt
         if b - start >= args.min_keep_s:
             snapped.append((start, b))
     LOG.info("   %s: %d clip(s) %s", src.name, len(snapped),
@@ -91,8 +103,20 @@ def cut_one(src: Path, out_dir: Path, entry: dict, args) -> list:
     # The removed spans go to their own folder so they can be reviewed: this is the footage the tool
     # decided contains faces, and it is the only way to check the decision was right.
     removed_dir = out_dir / "removed"
-    removed = [] if args.no_removed else [(x, y) for x, y in _gaps(snapped, duration)
-                                          if y - x >= args.min_removed_s]
+    removed = []
+    if not args.no_removed:
+        for x, y in _gaps(snapped, duration):
+            if y - x < args.min_removed_s:
+                continue
+            # A removed span is the leftover gap, so it can start mid-GOP and then will not decode.
+            # Snap its start BACK to the earliest preceding keyframe across the cameras. This overlaps
+            # the neighbouring kept clip by under a second, which is harmless: these files exist to be
+            # watched, not to be data.
+            start = x
+            for t in vt:
+                prior = [k for k in kf[t] if k <= x]
+                start = min(start, prior[-1] if prior else 0.0)
+            removed.append((start, y))
     if removed:
         removed_dir.mkdir(parents=True, exist_ok=True)
 
