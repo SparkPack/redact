@@ -6,6 +6,7 @@ and small MCAP helpers. There is no command line here; see redact_mcap.py.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
