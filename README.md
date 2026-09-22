@@ -100,14 +100,26 @@ python redact_mcap.py RECORDING.mcap OUT --mode blur \
 | `--conf-topic` | `wrist:0.99` | `wrist:0.99` | per-camera override |
 | `--min-keep-s` | 30 | 30 | shortest clip, and shortest recording, worth keeping |
 | `--pad-s` | 1.0 | 1.0 | margin cut either side of a face |
-| **`--merge-s`** | **0.0** | **20** | **joins faces closer than this into one cut** |
+| `--merge-s` | 0.0 | 20 (no effect) | joins faces closer than this; redundant when `--min-keep-s` is larger |
 | `--stride` | 3 | 3 | detect every Nth frame |
 | `--device` | 1 | 1 | GPU index |
 | `--min-removed-s` | 0.5 | 0.5 | shortest removed span written for review |
 
-**`--merge-s` is the trap.** Its default is 0, so if you omit it every face becomes its own cut and a
-recording fragments into dozens of clips. Every number in this README assumes `--merge-s 20`. It is
-the difference between 9 cuts and 40 on the same footage.
+**`--merge-s` is redundant at these settings — you can leave it out.** It joins faces closer together
+than its value into a single cut, but it can only absorb gaps shorter than itself, and any gap that
+short has already been discarded by `--min-keep-s 30`. Measured on a 32.7-minute recording:
+
+| `--min-keep-s` | `--merge-s` | clips | kept |
+|---|---|---|---|
+| 30 | 0 | 8 | 91.53% |
+| 30 | 20 | 8 | 91.53% |
+| 30 | 60 | 8 | 91.53% |
+| 0 | 0 | 21 | 96.62% |
+| 0 | 20 | 10 | 92.36% |
+
+Identical wherever `--merge-s` is at or below `--min-keep-s`. It matters only if you lower the
+minimum: at `--min-keep-s 0` it takes 21 clips down to 10. The IC-559 runs passed `--merge-s 20` and
+it changed nothing.
 
 `--device` defaults to 1 deliberately, not 0 — see Hardware notes.
 
@@ -232,8 +244,8 @@ Measured over six minutes of IC-559 footage:
 | 10 | 2 | a 12 s fragment plus the main run |
 | **30** | **1** | one unbroken run from 86 s on |
 
-At 30 s the merge distance stops mattering, because the minimum length decides everything. One knob
-instead of two.
+At 30 s the merge distance stops mattering, because the minimum length decides everything — see the
+`--merge-s` note above. One knob instead of two, and `--min-keep-s` is the one.
 
 **The same number also decides whether a recording is processed at all.** A source shorter than
 `--min-keep-s` cannot yield a clip worth keeping, so it produces no clips and no removed spans — it is
