@@ -216,9 +216,19 @@ def main(argv=None) -> int:
               else run_detection(a.input, a.output / "faces.json", a))
     by = {Path(f["file"]).name: f for f in report["files"]}
     LOG.info("cut mode, conf %.2f, minimum clip %.0fs", a.conf, a.min_keep_s)
-    records, skipped = [], []
+    records, skipped, short = [], [], []
     for src in srcs:
         e = by.get(src.name)
+        if e is not None and e.get("status") == "ok" and e["duration_s"] < a.min_keep_s:
+            # A recording shorter than the minimum clip length cannot yield a clip worth keeping, so
+            # it produces no output at all rather than a two-second fragment in cut/. It is still
+            # recorded here, because a source that silently leaves no trace is indistinguishable
+            # from one that was never processed.
+            LOG.info("   %s: %.1fs is under the %.0fs minimum, so nothing is written",
+                     src.name, e["duration_s"], a.min_keep_s)
+            short.append({"file": src.name, "duration_s": e["duration_s"],
+                          "reason": f"shorter than --min-keep-s ({a.min_keep_s:.0f}s)"})
+            continue
         if e is None or e.get("status") != "ok":
             LOG.error("   %s: detection produced no usable report for this file, so it was NOT cut "
                       "(the source may be truncated - check that it has a readable MCAP footer)",
@@ -245,11 +255,21 @@ def main(argv=None) -> int:
         fresh = {r["file"] for r in records}
         records = [r for r in prior if r["file"] not in fresh] + records
         records.sort(key=lambda r: r["file"])
+        # The too-short list needs the same treatment, or each run erases the one before it. A file
+        # cut this time also drops out of it, so changing --min-keep-s and re-running is consistent.
+        try:
+            prior_short = json.loads(man.read_text()).get("skipped_too_short", [])
+        except (OSError, ValueError):
+            prior_short = []
+        seen = {r["file"] for r in short} | fresh
+        short = [r for r in prior_short if r["file"] not in seen] + short
+        short.sort(key=lambda r: r["file"])
     rv.atomic_write_json(man, {
         "schema": "sparkpack-redact-cut/1", "created_utc": rv.utc_now(),
         "script_version": SCRIPT_VERSION,
         "params": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()},
         "files": records,
+        "skipped_too_short": short,
         "summary": {"files": len(records), "clips": sum(len(r["clips"]) for r in records),
                     "kept_s": round(sum(r["kept_s"] for r in records), 1),
                     "source_s": round(sum(r["duration_s"] for r in records), 1)},
