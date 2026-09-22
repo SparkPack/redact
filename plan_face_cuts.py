@@ -6,15 +6,19 @@ is not minimum footage removed but maximum usable run length - a dataset of long
 worth more than the same minutes chopped into fragments.
 
 Two knobs drive it:
-  --pad-s      widen each detection before cutting (safety margin around a face)
-  --merge-s    detections closer together than this become ONE cut
+  --pad-s        widen each detection before cutting (safety margin around a face)
+  --min-keep-s   the shortest clean run worth keeping; anything shorter is dropped, not kept
 
-Raising --merge-s trades a little extra footage for far fewer cuts, which is usually the right trade:
-merging two cuts 3 s apart costs 3 s and removes a useless 3 s fragment from the output. The tool
-sweeps --merge-s so you can see that curve before committing.
+--min-keep-s is the one that decides the shape of the output, so the tool sweeps it. Raising it
+trades a little footage for fewer, longer clips, which is usually the right trade: a dataset of long
+contiguous runs is worth more than the same minutes in fragments.
+
+(There used to be a --merge-s here too, joining detections closer than N seconds into one cut. It was
+removed: it can only absorb gaps shorter than itself, and --min-keep-s has already discarded those,
+so it changed nothing at any setting where --merge-s <= --min-keep-s.)
 
   python plan_face_cuts.py survey.json
-  python plan_face_cuts.py survey.json --merge-s 30 --min-keep-s 60 --json plan.json
+  python plan_face_cuts.py survey.json --min-keep-s 60 --json plan.json
 """
 from __future__ import annotations
 
@@ -61,9 +65,19 @@ def load(report: Path) -> tuple:
 
 def summarise(keep: list, drop: list, duration: float) -> dict:
     kept = sum(b - a for a, b in keep)
+    # What actually lands on disk is the gaps BETWEEN the kept clips, not the raw face spans: a face
+    # span too small to split anything, or a clean run below --min-keep-s, is absorbed into the
+    # neighbouring removal. Counting len(drop) would report 20 cuts where the pipeline writes 9.
+    gaps, prev = [], 0.0
+    for a, b in keep:
+        if a - prev > 1e-6:
+            gaps.append((prev, a))
+        prev = b
+    if duration - prev > 1e-6:
+        gaps.append((prev, duration))
     return {
-        "cuts": len(drop),
-        "removed_s": round(sum(b - a for a, b in drop), 1),
+        "cuts": len(gaps),
+        "removed_s": round(sum(b - a for a, b in gaps), 1),
         "kept_s": round(kept, 1),
         "kept_pct": round(100 * kept / duration, 1),
         "segments": len(keep),
@@ -76,8 +90,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("report", type=Path, help="detect_faces_mcap JSON")
     ap.add_argument("--pad-s", type=float, default=1.0)
-    ap.add_argument("--merge-s", type=float, default=None, help="if omitted, sweep a range and show the curve")
-    ap.add_argument("--min-keep-s", type=float, default=30.0, help="discard kept segments shorter than this")
+    ap.add_argument("--min-keep-s", type=float, default=None,
+                    help="discard clean runs shorter than this; if omitted, sweep a range and show the curve")
     ap.add_argument("--json", type=Path, default=None, help="write the chosen plan here")
     a = ap.parse_args(argv)
 
@@ -86,22 +100,22 @@ def main(argv=None) -> int:
     print(f"{Path(f['file']).name}")
     print(f"  {duration/60:.1f} min, {len(raw)} face intervals detected\n")
 
-    if a.merge_s is None:
-        print(f"  {'merge':>6} {'cuts':>5} {'removed':>9} {'kept':>9} {'segs':>5} {'longest':>9} {'median':>8}")
-        for m in (0, 2, 5, 10, 20, 30, 60, 120, 300):
-            d = merge(padded, m)
-            k = complement(d, duration, a.min_keep_s)
-            s = summarise(k, d, duration)
-            print(f"  {m:>6} {s['cuts']:>5} {s['removed_s']:>8.0f}s {s['kept_s']:>8.0f}s "
+    drop = merge(padded, 0.0)          # union of the padded face spans; nothing further to merge
+
+    if a.min_keep_s is None:
+        print(f"  {'min_keep':>8} {'cuts':>5} {'removed':>9} {'kept':>9} {'segs':>5} {'longest':>9} {'median':>8}")
+        for mk in (0, 5, 10, 20, 30, 60, 120, 300):
+            k = complement(drop, duration, mk)
+            s = summarise(k, drop, duration)
+            print(f"  {mk:>8} {s['cuts']:>5} {s['removed_s']:>8.0f}s {s['kept_s']:>8.0f}s "
                   f"{s['segments']:>5} {s['longest_s']:>8.0f}s {s['median_s']:>7.0f}s")
-        print("\n  Bigger --merge-s means fewer, longer clean runs at the cost of a little more footage.")
-        print("  Re-run with --merge-s N to write that plan.")
+        print("\n  Bigger --min-keep-s means fewer, longer clean runs at the cost of a little more footage.")
+        print("  Re-run with --min-keep-s N to write that plan.")
         return 0
 
-    drop = merge(padded, a.merge_s)
     keep = complement(drop, duration, a.min_keep_s)
     s = summarise(keep, drop, duration)
-    print(f"  merge {a.merge_s}s, pad {a.pad_s}s, min keep {a.min_keep_s}s -> {json.dumps(s)}\n")
+    print(f"  pad {a.pad_s}s, min keep {a.min_keep_s}s -> {json.dumps(s)}\n")
     print("  KEEP (face-free):")
     for i, (x, y) in enumerate(keep):
         print(f"    {i:>3}  {x:8.1f} - {y:8.1f}s   ({y-x:6.1f}s)")

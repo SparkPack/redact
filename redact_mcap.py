@@ -59,7 +59,10 @@ def cut_one(src: Path, out_dir: Path, entry: dict, args) -> list:
     for c in entry["channels"]:
         off = c["start_log_time"] - t0
         raw += [[off + a, off + b] for a, b in c["intervals_rel_s"]]
-    drop = merge([[max(0.0, a - args.pad_s), b + args.pad_s] for a, b in raw], args.merge_s)
+    # Gap 0: adjacent face spans are unioned, nothing further. A larger merge distance used to be
+    # offered here, but it can only absorb gaps shorter than itself and --min-keep-s has already
+    # discarded those, so it changed nothing at any usable setting.
+    drop = merge([[max(0.0, a - args.pad_s), b + args.pad_s] for a, b in raw], 0.0)
     # --min-keep-s exists to stop CUTTING leaving useless fragments behind. When there is no face
     # anywhere, nothing is being cut, so applying it would silently discard a perfectly clean
     # recording for being short. Six of the card_1 recordings are under 30 s and all are face-free.
@@ -180,7 +183,6 @@ def main(argv=None) -> int:
                    help="CUT MODE: discard any face-free stretch shorter than this instead of keeping a "
                         "fragment. This is the knob that turns many small cuts into a few long clips.")
     p.add_argument("--pad-s", type=float, default=1.0, help="cut mode: margin around each face")
-    p.add_argument("--merge-s", type=float, default=0.0, help="cut mode: merge faces closer than this")
     p.add_argument("--stride", type=int, default=3, help="detect every Nth frame")
     p.add_argument("--egoblur-weights", type=Path, default=HERE / "weights/ego_blur_face_gen2.jit")
     p.add_argument("--device", default="1")

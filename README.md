@@ -15,8 +15,13 @@ channels (IMU, thermal, logs) survive intact.
 
 ## Getting started on a fresh Ubuntu box
 
-Tested on Ubuntu 22.04 with two RTX 4090s. You need an NVIDIA GPU with ~8 GB free, driver 560 or
-newer (`nvidia-smi` should report a CUDA version of 12.6+), and about 10 GB of disk for the venv.
+**One NVIDIA GPU is enough.** The detector uses about 2.3 GB of VRAM in fp16, so any modern CUDA card
+with ~4 GB free will run it; a second GPU halves the wall-clock on a batch but changes nothing else.
+CPU-only works via `--device cpu` but is far too slow for hours of footage.
+
+Requirements: Linux with driver 560 or newer (`nvidia-smi` should report CUDA 12.6+), ~4 GB of free
+VRAM, and about 10 GB of disk for the venv. Developed on Ubuntu 22.04 with two RTX 4090s; the
+throughput figures below are per-GPU, so scale them to your card.
 
 **1. Install uv**, the Python package manager the setup script uses:
 
@@ -55,8 +60,8 @@ source ../.venv-redact/bin/activate
 python redact_mcap.py --help
 ```
 
-**5. Calibrate `--conf` on your own footage** before trusting any output. See below; do not reuse the
-0.95 from this repo.
+**5. Check `--conf` on a clean stretch of your own footage.** 0.95 is right for the Lens rig and
+transfers between rigs; confirm it holds in your environment before trusting a full run. See below.
 
 ### Troubleshooting
 
@@ -82,7 +87,7 @@ Copy them as-is; the rest of this README explains why each number is what it is.
 ```bash
 python redact_mcap.py RECORDING.mcap OUT --mode cut \
   --conf 0.95 --conf-topic wrist:0.99 \
-  --min-keep-s 30 --pad-s 1.0 --merge-s 20 --stride 3 --device 1
+  --min-keep-s 30 --pad-s 1.0 --stride 3 --device 1
 ```
 
 **Blur mode** — keeps every frame, blurs the face pixels:
@@ -100,26 +105,15 @@ python redact_mcap.py RECORDING.mcap OUT --mode blur \
 | `--conf-topic` | `wrist:0.99` | `wrist:0.99` | per-camera override |
 | `--min-keep-s` | 30 | 30 | shortest clip, and shortest recording, worth keeping |
 | `--pad-s` | 1.0 | 1.0 | margin cut either side of a face |
-| `--merge-s` | 0.0 | 20 (no effect) | joins faces closer than this; redundant when `--min-keep-s` is larger |
 | `--stride` | 3 | 3 | detect every Nth frame |
 | `--device` | 1 | 1 | GPU index |
 | `--min-removed-s` | 0.5 | 0.5 | shortest removed span written for review |
 
-**`--merge-s` is redundant at these settings — you can leave it out.** It joins faces closer together
-than its value into a single cut, but it can only absorb gaps shorter than itself, and any gap that
-short has already been discarded by `--min-keep-s 30`. Measured on a 32.7-minute recording:
-
-| `--min-keep-s` | `--merge-s` | clips | kept |
-|---|---|---|---|
-| 30 | 0 | 8 | 91.53% |
-| 30 | 20 | 8 | 91.53% |
-| 30 | 60 | 8 | 91.53% |
-| 0 | 0 | 21 | 96.62% |
-| 0 | 20 | 10 | 92.36% |
-
-Identical wherever `--merge-s` is at or below `--min-keep-s`. It matters only if you lower the
-minimum: at `--min-keep-s 0` it takes 21 clips down to 10. The IC-559 runs passed `--merge-s 20` and
-it changed nothing.
+**There is no `--merge-s`.** It used to join faces closer together than N seconds into one cut, and it
+was removed because it could not change the result: merging only absorbs gaps shorter than itself, and
+`--min-keep-s` has already discarded those. Measured before removing it, output was identical to the
+second decimal for every value from 0 to 60. `--min-keep-s` is the knob that shapes the output; use
+`plan_face_cuts.py` to sweep it.
 
 `--device` defaults to 1 deliberately, not 0 — see Hardware notes.
 
@@ -134,7 +128,7 @@ for f in source/*.mcap; do
   case "$(basename "$f")" in system_logs_*) continue;; esac
   python redact_mcap.py "$f" OUT --mode cut \
     --conf 0.95 --conf-topic wrist:0.99 \
-    --min-keep-s 30 --pad-s 1.0 --merge-s 20 --stride 3 --device 1 || echo "FAILED: $f"
+    --min-keep-s 30 --pad-s 1.0 --stride 3 --device 1 || echo "FAILED: $f"
 done
 ```
 
@@ -184,10 +178,19 @@ told apart from one that was never processed.
 
 ## Setting `--conf`, the one number that matters
 
-**Do not reuse a threshold from another rig.** Calibrate it, using footage you know contains no faces:
+**0.95 transfers across Lens rigs — they are identical hardware.** Same cameras, same optics, same
+geometry, so a score means the same thing on any of them. You do not need to recalibrate per rig, and
+`--conf-topic wrist:0.99` carries over for the same reason.
 
-1. Run detection over a stretch you have watched and know is clean.
-2. Raise `--conf` until it reports zero detections there.
+**What can change is the environment.** The false positives at 0.95 are things in the workspace that
+happen to look face-like: on IC-559 a blue gloved hand and a white plastic clip. A different site with
+different gloves, equipment, lighting or backgrounds may produce a different set. So verify rather
+than recalibrate:
+
+1. Run detection over a stretch of the new footage you have watched and know is clean.
+2. If it reports nothing, 0.95 is fine — keep it.
+3. If it fires repeatedly on one object, look at that object at full resolution before touching the
+   threshold, and read the ceiling note below first.
 
 Measured on IC-559 footage over four face-free minutes:
 
@@ -244,8 +247,14 @@ Measured over six minutes of IC-559 footage:
 | 10 | 2 | a 12 s fragment plus the main run |
 | **30** | **1** | one unbroken run from 86 s on |
 
-At 30 s the merge distance stops mattering, because the minimum length decides everything — see the
-`--merge-s` note above. One knob instead of two, and `--min-keep-s` is the one.
+Sweep it on your own footage before committing:
+
+```bash
+python plan_face_cuts.py faces.json
+```
+
+That prints cuts, footage kept, and the longest and median clip for a range of values, so you can see
+the trade rather than guess it.
 
 **The same number also decides whether a recording is processed at all.** A source shorter than
 `--min-keep-s` cannot yield a clip worth keeping, so it produces no clips and no removed spans — it is
@@ -306,14 +315,20 @@ python redact_mcap.py B.mcap OUT --mode cut ... --device 1
 That is close to a 2x speedup, since the files are independent. Both processes append to the same
 `cut_manifest.json` safely — it is merged by filename, not rewritten.
 
-Measured throughput, one RTX 4090, five 1920x1200 channels at 30 fps:
+Throughput scales with the card and with how many you have. Measured on **one RTX 4090**, five
+1920x1200 channels at 30 fps — a slower GPU takes proportionally longer, and two GPUs on separate
+files roughly halve the total:
 
 | stage | rate | per hour of footage |
 |---|---|---|
-| detection, stride 3 | ~110 fps | ~80 min |
+| detection, stride 3, one GPU | ~110 fps | ~80 min |
 | detection, stride 3, two GPUs on separate files | ~220 fps | ~40 min |
 | blur, stride 3, one GPU | 154 fps | ~58 min |
-| blur, stride 3, both GPUs | 189 fps | ~48 min |
+| blur, stride 3, two GPUs | 189 fps | ~48 min |
+
+Detection is the GPU-bound stage; writing the clips is disk-bound, so expect the card to idle while a
+20 GB recording is written out. That also means a faster GPU helps less than its specs suggest on cut
+mode, where much of the wall-clock is I/O.
 
 Cutting 5.3 hours of five-camera footage took about 7 hours on one GPU, and the writing is disk-bound
 rather than GPU-bound — expect the card to sit idle while a 20 GB recording is written out.
