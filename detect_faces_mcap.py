@@ -219,6 +219,9 @@ def detect_channels_batched(topics: list, packets: dict, times: dict, codecs: di
     decs, scales, dims = {}, {}, {}
     for topic in topics:
         w, h = probe_stream(tools, packets[topic][:8], codecs[topic])
+        if not w or not h:
+            raise RuntimeError(f"{topic}: ffmpeg reported a {w}x{h} frame, so this channel cannot be "
+                               f"decoded even from its first keyframe")
         dec = PacketDecoder(tools, codecs[topic], w, h, args.scale, args.gpu_decode, args.gpu_index)
         decs[topic] = dec
         dims[topic] = (w, h)
@@ -315,6 +318,9 @@ def detect_channel(topic: str, packets: list[bytes], times: list[float], codec: 
     t0 = time.time()
     _, detect = detector_factory()
     width, height = probe_stream(tools, packets[:8], codec)
+    if not width or not height:
+        raise RuntimeError(f"{topic}: ffmpeg reported a {width}x{height} frame, so this channel "
+                           f"cannot be decoded even from its first keyframe")
     dec = PacketDecoder(tools, codec, width, height, args.scale, args.gpu_decode, args.gpu_index)
 
     def feed_all():
@@ -427,6 +433,22 @@ def process_file(path: Path, tools: rv.FFTools, args, detector_factory) -> dict:
                 wanted.discard(topic)
                 if not wanted:
                     break
+    # An excerpt (a cut clip, or a removed span) can begin before a given camera's own first keyframe,
+    # because the five cameras' keyframes fall milliseconds apart and a cut lands on one instant. Those
+    # leading packets reference frames that are not in the file, so ffmpeg cannot open the stream and
+    # probe_stream reports 0x0 - which used to surface as "division by zero" from w / dec.ow. Drop them.
+    # A whole source recording starts on a keyframe, so nothing is trimmed there.
+    for topic in list(packets):
+        first = next((i for i, pk in enumerate(packets[topic]) if rv.is_keyframe(pk)), None)
+        if first is None:
+            LOG.warning("%s %s: no keyframe in %d packets; this channel cannot be decoded",
+                        path.name, topic, len(packets[topic]))
+            continue
+        if first:
+            LOG.info("%s %s: skipping %d packet(s) before the first keyframe", path.name, topic, first)
+            packets[topic] = packets[topic][first:]
+            times[topic] = times[topic][first:]
+
     read_s = time.time() - t0
     LOG.info("%s: %d video channels, %d packets read in %.1fs", path.name, len(packets),
              sum(len(v) for v in packets.values()), read_s)
