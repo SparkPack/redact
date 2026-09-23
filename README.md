@@ -272,27 +272,76 @@ ground. Lowering the threshold makes residual "detections" go *up*. Judge blurre
 with a face *recognition* model. Detector-on-output only proves anything for cut mode, where the
 pixels are genuinely gone.
 
-## Reviewing the result
+## Reviewing the result: `mcap_to_mosaic.py`
+
+Renders every camera in a recording into one video, tiled side by side and captioned, so five feeds
+can be judged at a glance. This is how you check a redaction — there is no other practical way to
+look at five synchronised 1920x1200 streams.
 
 ```bash
-python mcap_to_mosaic.py OUT/recording.mcap preview.mp4 --device 1
+python mcap_to_mosaic.py INPUT.mcap preview.mp4 --device 1
 vlc --avcodec-hw=none preview.mp4
 ```
 
-All cameras tiled with labels and a timestamp. `--every 6` gives a 6x shorter timelapse.
+`INPUT` may be a **folder**, in which case `OUTPUT` is a folder too and each log becomes one mp4:
 
-**Always pass `--faces` when reviewing a cut.** It draws a red box, labelled with its score, on every
-detection, matched by source log time so a report made on the original recording lines up with a clip
-taken out of it:
+```bash
+python mcap_to_mosaic.py OUT/removed OUT/removed/previews --device 1
+```
+
+Feeds are aligned by MCAP log time rather than frame order, so a channel that drops a frame stays in
+sync instead of drifting, and a feed with no frame yet holds its previous one. A feed whose packets
+start before its own first keyframe has them skipped automatically — that happens on cut clips,
+because the five cameras' keyframes fall milliseconds apart.
+
+### Always use `--faces` when reviewing a cut
+
+It draws a red box, labelled with its score, on every detection:
 
 ```bash
 python mcap_to_mosaic.py OUT/removed/rec_removed00.mcap review.mp4 --faces faces.json --device 1
 ```
 
-Without it the mosaic is actively misleading. Tiles scale 1920 down to 640, so a 63 px face renders at
-about 21 px and reads as a smudge — a **correct** detection looks like a false positive, which would
-push you to loosen the threshold and start leaking real faces. Never conclude "no face here" from an
-unboxed mosaic; check the source at full resolution.
+Without it the mosaic is **actively misleading**. Tiles scale 1920 down to 640, so a 63 px face
+renders at about 21 px and reads as a smudge — a *correct* detection looks like a false positive,
+which would push you to loosen the threshold and start leaking real faces. Never conclude "no face
+here" from an unboxed mosaic; check the source at full resolution instead.
+
+Matching is by source log time, so a report made on the whole recording still lines up with a clip cut
+out of it. **But `redact_mcap.py` overwrites `OUT/faces.json` on every invocation**, so after cutting
+several recordings only the last one's report survives. To box an excerpt whose report is gone, re-run
+detection on the excerpt itself — they are small, and the result matches exactly:
+
+```bash
+python detect_faces_mcap.py CLIP.mcap --face-detector egoblur \
+  --egoblur-weights weights/ego_blur_face_gen2.jit --scale 1.0 --half \
+  --conf 0.95 --conf-topic wrist:0.99 --stride 1 --device 1 --no-sha256 -o clip.json
+python mcap_to_mosaic.py CLIP.mcap review.mp4 --faces clip.json --device 1
+```
+
+Use `--stride 1` there. The cut ran at stride 3 to go faster, but a review artefact should miss
+nothing, and the excerpts are short enough that it costs little.
+
+### Options
+
+| flag | default | what it does |
+|---|---|---|
+| `--faces` | none | a detect_faces_mcap report; draws a labelled box per detection |
+| `--face-hold-s` | 0.2 | how long each box stays visible either side of its own frame |
+| `--every N` | 1 | keep every Nth frame: an N-times-SHORTER video that plays at normal speed |
+| `--tile-width` | 640 | width of each tile; raise it to see small faces, at the cost of size |
+| `--cols` | 3 for 5+ feeds | grid columns |
+| `--topics` | all | render only these video topics |
+| `--fps` | source rate | output frame rate |
+| `--codec` | `h264_nvenc` | falls back to libx264 if the encoder is unavailable |
+| `--device` | 0 | GPU index for NVENC |
+
+`--every 6` turns a 33-minute recording into a 5.5-minute timelapse. It saves your viewing time, not
+much rendering time (~35%): every source frame must still be decoded because of h264 inter-frame
+dependencies.
+
+`--face-hold-s` matters because detection runs at a stride. At `--stride 3` a box exists on every
+third frame only, and without the hold it flickers past too fast to see.
 
 Play previews with `--avcodec-hw=none`: VLC's GPU decoding raised an Xid fault on GPU 0 that took the
 whole machine down.
